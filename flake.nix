@@ -30,12 +30,17 @@
           pname = "recorder";
           src = ./.;
 
-          nativeBuildInputs = [
-            pkgs.sqlx-cli
-            pkgs.jq
-            pkgs.nodejs
-            pkgs.openapi-generator-cli
-            pkgs.tree
+          nativeBuildInputs = with pkgs; [
+            sqlx-cli
+            jq
+            nodejs
+            openapi-generator-cli
+            tree
+          ];
+
+          buildInputs = with pkgs; [
+            makeWrapper
+            ffmpeg
           ];
 
           preBuild = ''
@@ -55,9 +60,11 @@
               -g rust \
               -o ./rbg_client \
               --additional-properties=avoidBoxedModels=true,snakeCaseOperationId=true
+          '';
 
-            # tree
-            # exit 1
+          postInstall = ''
+            wrapProgram $out/bin/recorder \
+              --set PATH ${pkgs.ffmpeg}/bin:$PATH
           '';
         };
 
@@ -99,6 +106,7 @@
           packages = with pkgs; [
             rust-analyzer
             sqlx-cli
+            ffmpeg
           ];
         };
       }

@@ -1,10 +1,17 @@
-use chrono::{TimeZone, Utc};
-use m3u8_rs::{parse_playlist, parse_playlist_res};
+use chrono::{DateTime, TimeZone, Utc};
+use rbg_client::apis::configuration::Configuration;
+use rbg_client::models::ProtobufCourseStream;
 use reqwest::cookie::Jar;
+use tokio::fs::File;
+use tokio::process::Command;
 
+use sanitize_filename::sanitize;
+use std::collections::HashMap;
 use std::env;
+use std::path::Path;
+use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::thread::spawn;
 use std::time::Duration;
 use thirtyfour::prelude::*;
 use tokio::time::sleep;
@@ -13,7 +20,7 @@ use url::Url;
 use rbg_client;
 
 pub fn convert_thirtyfour_cookies(
-    cookies: &[Cookie],
+    cookies: &[thirtyfour::Cookie],
     current_url: &str,
 ) -> Vec<(String, Url)> {
     let current_url_parsed =
@@ -62,12 +69,87 @@ pub fn convert_thirtyfour_cookies(
     result
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
+    println!(
+        "Running recorder for stream: {} - {}",
+        stream.course, stream.name
+    );
+
+    let safe_course = sanitize(&stream.course);
+    let safe_name = sanitize(&stream.name);
+
+    let base_dir = Path::new("recordings").join(&safe_course);
+    let out_file = base_dir.join(format!("{}.mkv", safe_name));
+    let final_file = base_dir.join(format!("{}.mp4", safe_name));
+    let log_dir = base_dir.join("logs");
+
+    tokio::fs::create_dir_all(&log_dir).await?;
+
+    let stdout_log = log_dir.join(format!("{}_stdout.log", safe_name));
+    let stderr_log = log_dir.join(format!("{}_stderr.log", safe_name));
+
+    let stdout_file = File::create(&stdout_log).await?;
+    let stderr_file = File::create(&stderr_log).await?;
+
+    let mut child = Command::new("ffmpeg")
+        .args(&[
+            "-i",
+            &stream.url.to_string(),
+            "-c",
+            "copy",
+            "-y",
+            out_file.to_str().unwrap(),
+        ])
+        .stdout(Stdio::from(stdout_file.into_std().await))
+        .stderr(Stdio::from(stderr_file.into_std().await))
+        .spawn()?;
+
+    let status = child.wait().await?;
+    println!("ffmpeg exited with: {}", status);
+
+    let stdout_log = log_dir.join(format!("{}_convert_stdout.log", safe_name));
+    let stderr_log = log_dir.join(format!("{}_convert_stderr.log", safe_name));
+
+    let stdout_file = File::create(&stdout_log).await?;
+    let stderr_file = File::create(&stderr_log).await?;
+
+    println!("converting to mp4: {}", safe_name);
+
+    let mut child = Command::new("ffmpeg")
+        .args(&[
+            "-i",
+            out_file.to_str().unwrap(),
+            "-codec",
+            "copy",
+            "-y",
+            final_file.to_str().unwrap(),
+        ])
+        .stdout(Stdio::from(stdout_file.into_std().await))
+        .stderr(Stdio::from(stderr_file.into_std().await))
+        .spawn()?;
+
+    let status = child.wait().await?;
+    println!("ffmpeg exited with: {}", status);
+
+    Ok(())
+}
+
+async fn recorder_thread(stream: Stream) {
+    match run_recorder(&stream).await {
+        Ok(()) => {
+            println!("Finished recording: {} - {}", stream.course, stream.name)
+        }
+        Err(e) => eprintln!(
+            "Failed recording: {} - {} due to: {}",
+            stream.course, stream.name, e
+        ),
+    }
+}
+
+async fn login() -> anyhow::Result<Vec<(String, Url)>> {
     let username = env::var("TUM_USERNAME")
         .expect("Environment variable TUM_USERNAME not set");
 
-    // Read password from env
     let password = env::var("TUM_PASSWORD")
         .expect("Environment variable TUM_PASSWORD not set");
 
@@ -108,6 +190,68 @@ async fn main() -> anyhow::Result<()> {
 
     let cookie_pairs =
         convert_thirtyfour_cookies(&cookies, &current_url.to_string());
+
+    return Ok(cookie_pairs);
+}
+
+#[derive(Debug)]
+struct Stream {
+    id: i64,
+    course: String,
+    name: String,
+    url: Url,
+}
+
+fn extract_stream(live_course: ProtobufCourseStream) -> Option<Stream> {
+    let course_name = live_course.course?.name?;
+    let stream = live_course.stream?;
+    let stream_id = stream.id?;
+
+    let name = stream
+        .name
+        .filter(|name| !name.is_empty())
+        .clone()
+        .or_else(|| {
+            stream.start.as_ref().and_then(|s| {
+                s.parse::<DateTime<Utc>>()
+                    .ok()
+                    .map(|dt| dt.format("%Y-%m-%d_%H:%M").to_string())
+            })
+        })
+        .unwrap_or_else(|| stream_id.to_string());
+
+    let url = stream.hls_url.or(stream.playlist_url)?;
+    let url = Url::from_str(&url).ok()?;
+
+    Some(Stream {
+        id: stream_id,
+        course: course_name,
+        name,
+        url,
+    })
+}
+
+async fn get_streams(
+    configuration: &Configuration,
+) -> anyhow::Result<Vec<Stream>> {
+    let live_courses =
+        rbg_client::apis::courses_api::get_live_courses(&configuration).await?;
+
+    let mut streams = Vec::new();
+    if let Some(live_courses) = live_courses.live_courses {
+        for live_course in live_courses {
+            if let Some(stream) = extract_stream(live_course) {
+                streams.push(stream);
+            }
+        }
+    }
+    Ok(streams)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cookie_pairs = login().await?;
+
     let jar = Jar::default();
     for (cookie_str, url) in cookie_pairs {
         jar.add_cookie_str(&cookie_str, &url);
@@ -121,41 +265,22 @@ async fn main() -> anyhow::Result<()> {
         rbg_client::apis::configuration::Configuration::new();
     configuration.client = client;
 
-    let live_courses =
-        rbg_client::apis::courses_api::get_live_courses(&configuration).await?;
+    let mut recorders = HashMap::new();
 
-    if let Some(live_courses) = live_courses.live_courses {
-        for live_course in &live_courses {
-            println!("Course:");
-            if let Some(course) = &live_course.course {
-                if let Some(name) = &course.name {
-                    println!("    Name: {}", name);
+    loop {
+        match get_streams(&configuration).await {
+            Ok(streams) => {
+                for stream in streams {
+                    let id = stream.id;
+                    if !recorders.contains_key(&id) {
+                        let recorder = tokio::spawn(recorder_thread(stream));
+                        recorders.insert(id, recorder);
+                    }
                 }
             }
-
-            if let Some(stream) = &live_course.stream {
-                println!("    Stream:");
-                if let Some(name) = &stream.name {
-                    println!("        Name: {}", name);
-                }
-                if let Some(playlist_url) = &stream.playlist_url {
-                    println!("        Playlist Url: {}", playlist_url);
-                }
-                if let Some(playlist_url_pres) = &stream.playlist_url_pres {
-                    println!(
-                        "        Playlist Url Pres: {}",
-                        playlist_url_pres
-                    );
-                }
-                if let Some(playlist_url_cam) = &stream.playlist_url_cam {
-                    println!("        Playlist Url Cam: {}", playlist_url_cam);
-                }
-                if let Some(hls_url) = &stream.hls_url {
-                    println!("        HLS Url: {}", hls_url);
-                }
-            }
+            Err(e) => eprintln!("failed getting courses: {}", e),
         }
-    }
 
-    Ok(())
+        sleep(Duration::from_secs(10)).await;
+    }
 }
