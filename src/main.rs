@@ -71,8 +71,8 @@ pub fn convert_thirtyfour_cookies(
 
 async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     println!(
-        "Running recorder for stream: {} - {}",
-        stream.course, stream.name
+        "Running recorder for stream {}: {} - {}",
+        stream.id, stream.course, stream.name
     );
 
     let safe_course = sanitize(&stream.course);
