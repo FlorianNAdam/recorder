@@ -70,7 +70,7 @@
           passthru = {
             dockerImage = pkgs.dockerTools.buildImage {
               name = "recorder";
-              tag = "latest";
+              tag = "${recorder.version}";
 
               copyToRoot = [
                 pkgs.cacert
