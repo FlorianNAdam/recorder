@@ -155,18 +155,11 @@ async fn recorder_thread(stream: Stream, cookie_string: String) {
     }
 }
 
-async fn login(
-    webdriver_url: &str,
+async fn inner_login(
+    driver: &WebDriver,
     username: &str,
     password: &str,
-    headless: bool,
 ) -> anyhow::Result<Vec<(String, Url)>> {
-    let mut caps = DesiredCapabilities::firefox();
-    if headless {
-        caps.set_headless()?;
-    }
-    let driver = WebDriver::new(webdriver_url, caps).await?;
-
     driver
         .goto("https://live.rbg.tum.de/saml/out")
         .await?;
@@ -196,12 +189,28 @@ async fn login(
 
     let cookies = driver.get_all_cookies().await?;
     let current_url = driver.current_url().await?;
-    driver.quit().await?;
 
     let cookie_pairs =
         convert_thirtyfour_cookies(&cookies, &current_url.to_string());
 
     Ok(cookie_pairs)
+}
+
+async fn login(
+    webdriver_url: &str,
+    username: &str,
+    password: &str,
+    headless: bool,
+) -> anyhow::Result<Vec<(String, Url)>> {
+    let mut caps = DesiredCapabilities::firefox();
+    if headless {
+        caps.set_headless()?;
+    }
+    let driver = WebDriver::new(webdriver_url, caps).await?;
+    let result = inner_login(&driver, username, password).await;
+    driver.quit().await?;
+
+    result
 }
 
 #[derive(Debug)]

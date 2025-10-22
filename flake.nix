@@ -26,24 +26,18 @@
           sha256 = "sha256-0TP61ZA6dWt204ciK4KG2M14aU6oK9sEntA7c5ZiKqY=";
         };
 
-        recorder = naersk-lib.buildPackage {
-          pname = "recorder";
-          src = ./.;
+        rbg-client = pkgs.stdenv.mkDerivation {
+          pname = "rbg-client";
+          version = "0.1.0";
+
+          src = apiv2Swagger;
 
           nativeBuildInputs = with pkgs; [
-            sqlx-cli
-            jq
-            nodejs
             openapi-generator-cli
-            tree
+            jq
           ];
 
-          buildInputs = with pkgs; [
-            makeWrapper
-            ffmpeg
-          ];
-
-          preBuild = ''
+          buildCommand = ''
             set -e
 
             cp ${apiv2Swagger} ./apiv2.swagger.json
@@ -51,7 +45,6 @@
             jq '.paths |= with_entries(
                   .value |= with_entries(
                     .value |= (if has("operationId") then .operationId |= sub("^API_";"") else . end)
-
                   )
                 )' apiv2.swagger.json > apiv2.clean.swagger.json
 
@@ -60,11 +53,26 @@
               -g rust \
               -o ./rbg_client \
               --additional-properties=avoidBoxedModels=true,snakeCaseOperationId=true
+
+            mkdir -p $out
+            cp -r ./rbg_client/* $out/
           '';
+        };
+
+        recorder = naersk-lib.buildPackage {
+          pname = "recorder";
+          src = ./.;
+
+          buildInputs = with pkgs; [
+            makeWrapper
+            ffmpeg-headless
+          ];
+
+          preBuild = ''cp -r ${rbg-client} ./rbg_client'';
 
           postInstall = ''
             wrapProgram $out/bin/recorder \
-              --set PATH ${pkgs.ffmpeg}/bin:$PATH
+              --set PATH ${pkgs.ffmpeg-headless}/bin:$PATH
           '';
 
           passthru = {
@@ -102,7 +110,7 @@
           packages = with pkgs; [
             rust-analyzer
             sqlx-cli
-            ffmpeg
+            ffmpeg-headless
           ];
         };
       }
