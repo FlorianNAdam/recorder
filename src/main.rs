@@ -1,5 +1,6 @@
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
+
 use rbg_client::apis::configuration::Configuration;
 use rbg_client::models::ProtobufCourseStream;
 use reqwest::cookie::Jar;
@@ -111,7 +112,7 @@ async fn run_recorder(
         out_file.to_str().unwrap(),
     ]);
 
-    info!("running ffmpeg: {:?}", command.as_std());
+    info!("Running ffmpeg: {:?}", command.as_std());
 
     let mut child = command
         .stdout(Stdio::from(stdout_file.into_std().await))
@@ -129,7 +130,7 @@ async fn run_recorder(
     let stdout_file = File::create(&stdout_log).await?;
     let stderr_file = File::create(&stderr_log).await?;
 
-    info!("converting to mp4: {}", safe_name);
+    info!("Converting to mp4: {}", safe_name);
 
     let mut child = Command::new("ffmpeg")
         .args(&[
@@ -145,7 +146,9 @@ async fn run_recorder(
         .spawn()?;
 
     let status = child.wait().await?;
-    info!("ffmpeg exited with: {}", status);
+    if !status.success() {
+        anyhow::bail!("ffmpeg failed (exit code: {})", status)
+    }
 
     Ok(())
 }
@@ -496,16 +499,16 @@ struct Args {
     password: String,
 
     /// How long to use a login session
-    #[arg(long, default_value_t = 10)]
-    session_timeout: u64,
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "6h")]
+    session_timeout: Duration,
 
     /// Run browser in headless mode
     #[arg(long, default_value_t = true)]
     headless: bool,
 
-    /// Poll interval in seconds for checking new streams
-    #[arg(long, default_value_t = 10)]
-    poll_interval: u64,
+    /// Poll interval for checking new streams
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "1m")]
+    poll_interval: Duration,
 
     /// API mode: v1, v2, or both (default: both)
     #[arg(long, value_enum, default_value_t = ApiMode::V1)]
@@ -515,7 +518,7 @@ struct Args {
 async fn create_client(cookies: &[(String, Url)]) -> Client {
     let jar = Jar::default();
     for (cookie_str, url) in cookies {
-        info!("cookie {}: {}", url, cookie_str);
+        info!("Cookie {}: {}", url, cookie_str);
         jar.add_cookie_str(&cookie_str, &url);
     }
 
@@ -549,7 +552,7 @@ async fn main() {
     let mut last_login = Instant::now();
 
     loop {
-        if last_login.elapsed() >= Duration::from_secs(24 * 60 * 60) {
+        if last_login.elapsed() >= args.session_timeout {
             cookies = login_with_backoff(
                 &args.webdriver_url,
                 &args.username,
@@ -582,9 +585,9 @@ async fn main() {
                     create_recorder(stream, cookies, recorders).await
                 }
             }
-            Err(e) => error!("failed getting courses: {:#?}", e),
+            Err(e) => error!("Failed getting courses: {:#?}", e),
         }
 
-        sleep(Duration::from_secs(args.poll_interval)).await;
+        sleep(args.poll_interval).await;
     }
 }
