@@ -19,6 +19,8 @@ use url::Url;
 
 use rbg_client;
 
+use log::{debug, error, info, warn};
+
 pub fn convert_thirtyfour_cookies(
     cookies: &[thirtyfour::Cookie],
     current_url: &str,
@@ -73,7 +75,7 @@ async fn run_recorder(
     stream: &Stream,
     cookie_string: &String,
 ) -> anyhow::Result<()> {
-    println!(
+    info!(
         "Running recorder for stream {}: {} - {}",
         stream.id, stream.course, stream.name
     );
@@ -100,13 +102,11 @@ async fn run_recorder(
         &stream.url.to_string(),
         "-c",
         "copy",
-        // "-headers",
-        // &format!("Cookie: {}", cookie_string),
         "-y",
         out_file.to_str().unwrap(),
     ]);
 
-    println!("running ffmpeg: {:?}", command);
+    info!("running ffmpeg: {:?}", command);
 
     let mut child = command
         .stdout(Stdio::from(stdout_file.into_std().await))
@@ -114,7 +114,7 @@ async fn run_recorder(
         .spawn()?;
 
     let status = child.wait().await?;
-    println!("ffmpeg exited with: {}", status);
+    info!("ffmpeg exited with: {}", status);
 
     let stdout_log = log_dir.join(format!("{}_convert_stdout.log", safe_name));
     let stderr_log = log_dir.join(format!("{}_convert_stderr.log", safe_name));
@@ -122,7 +122,7 @@ async fn run_recorder(
     let stdout_file = File::create(&stdout_log).await?;
     let stderr_file = File::create(&stderr_log).await?;
 
-    println!("converting to mp4: {}", safe_name);
+    info!("converting to mp4: {}", safe_name);
 
     let mut child = Command::new("ffmpeg")
         .args(&[
@@ -138,7 +138,7 @@ async fn run_recorder(
         .spawn()?;
 
     let status = child.wait().await?;
-    println!("ffmpeg exited with: {}", status);
+    info!("ffmpeg exited with: {}", status);
 
     Ok(())
 }
@@ -146,9 +146,9 @@ async fn run_recorder(
 async fn recorder_thread(stream: Stream, cookie_string: String) {
     match run_recorder(&stream, &cookie_string).await {
         Ok(()) => {
-            println!("Finished recording: {} - {}", stream.course, stream.name)
+            info!("Finished recording: {} - {}", stream.course, stream.name)
         }
-        Err(e) => eprintln!(
+        Err(e) => error!(
             "Failed recording: {} - {} due to: {}",
             stream.course, stream.name, e
         ),
@@ -200,7 +200,7 @@ async fn login() -> anyhow::Result<Vec<(String, Url)>> {
     let cookie_pairs =
         convert_thirtyfour_cookies(&cookies, &current_url.to_string());
 
-    return Ok(cookie_pairs);
+    Ok(cookie_pairs)
 }
 
 #[derive(Debug)]
@@ -280,14 +280,13 @@ fn extract_stream_v2(live_course: ProtobufCourseStream) -> Option<Stream> {
 async fn get_streams(
     configuration: &Configuration,
 ) -> anyhow::Result<Vec<Stream>> {
-    let result = get_streams_v2(configuration).await;
-    match result {
-        Ok(streams) => {
-            return Ok(streams);
+    match get_streams_v2(configuration).await {
+        Ok(streams) => Ok(streams),
+        Err(e) => {
+            warn!("failed getting courses with v2 api: {}", e);
+            get_streams_v1(configuration).await
         }
-        Err(e) => eprintln!("failed getting courses with v2 api: {}", e),
     }
-    get_streams_v1(configuration).await
 }
 
 use serde::Deserialize;
@@ -356,35 +355,34 @@ async fn get_streams_v2(
 fn ffmpeg_cookie_string(jar: &Jar, url: &str) -> anyhow::Result<String> {
     let url = Url::from_str(url)?;
 
-    // Extract cookie header for that URL
     let cookies_opt = jar.cookies(&url);
     if cookies_opt.is_none() {
         return Ok(String::new());
     }
 
-    // Convert to string
     let cookies_str = cookies_opt
         .unwrap()
         .to_str()?
         .to_string();
 
-    // Escape characters that can confuse ffmpeg’s CLI parser
-    // (like semicolons and quotes)
     let safe_str = cookies_str
-        .replace(';', "%3B") // semicolon escape
-        .replace('"', "%22") // quote escape
-        .replace('\\', "\\\\"); // backslash safety
+        .replace(';', "%3B")
+        .replace('"', "%22")
+        .replace('\\', "\\\\");
 
     Ok(safe_str)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    info!("Starting RBG recorder...");
+
     let cookie_pairs = login().await?;
 
     let jar = Jar::default();
     for (cookie_str, url) in cookie_pairs {
-        println!("cookie {}: {}", url, cookie_str);
+        info!("cookie {}: {}", url, cookie_str);
         jar.add_cookie_str(&cookie_str, &url);
     }
 
@@ -394,8 +392,7 @@ async fn main() -> anyhow::Result<()> {
         .cookie_provider(Arc::new(jar))
         .build()?;
 
-    let mut configuration =
-        rbg_client::apis::configuration::Configuration::new();
+    let mut configuration = Configuration::new();
     configuration.client = client;
 
     let mut recorders = HashMap::new();
@@ -415,7 +412,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(e) => eprintln!("failed getting courses: {}", e),
+            Err(e) => error!("failed getting courses: {}", e),
         }
 
         sleep(Duration::from_secs(10)).await;

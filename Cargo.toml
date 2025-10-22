@@ -25,3 +25,5 @@ url = { version = "2.5.7", features = ["serde"] }
 rbg_client = {path="./rbg_client", package="openapi"}
 m3u8-rs = "6.0.0"
 sanitize-filename = "0.6.0"
+env_logger = "0.11.8"
+log = "0.4.28"
