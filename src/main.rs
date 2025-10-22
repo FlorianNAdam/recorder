@@ -73,7 +73,7 @@ pub fn convert_thirtyfour_cookies(
     result
 }
 
-async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
+async fn run_recorder(stream: &Stream, _cookies: String) -> anyhow::Result<()> {
     info!(
         "Running recorder for stream {}: {} - {}",
         stream.id, stream.course, stream.name
@@ -95,10 +95,13 @@ async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     let stdout_file = File::create(&stdout_log).await?;
     let stderr_file = File::create(&stderr_log).await?;
 
+    let mut url = stream.url.clone();
+    url.set_query(Some("dvr"));
+
     let mut command = Command::new("ffmpeg");
     command.args(&[
         "-i",
-        &stream.url.to_string(),
+        url.as_str(),
         "-c",
         "copy",
         "-y",
@@ -142,8 +145,8 @@ async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn recorder_thread(stream: Stream) {
-    match run_recorder(&stream).await {
+async fn recorder_thread(stream: Stream, cookies: String) {
+    match run_recorder(&stream, cookies).await {
         Ok(()) => {
             info!("Finished recording: {} - {}", stream.course, stream.name)
         }
@@ -162,6 +165,7 @@ struct Recorder {
 
 async fn create_recorder(
     stream: Stream,
+    cookies: String,
     recorders: Arc<Mutex<HashMap<i64, Recorder>>>,
 ) {
     let id = stream.id;
@@ -171,7 +175,7 @@ async fn create_recorder(
             let recorders = recorders.clone();
             let stream = stream.clone();
             tokio::spawn(async move {
-                recorder_thread(stream).await;
+                recorder_thread(stream, cookies).await;
                 sleep(Duration::from_secs(10)).await;
                 let mut locked_recorders = recorders.lock().await;
                 locked_recorders.remove(&id);
@@ -464,21 +468,13 @@ struct Args {
     poll_interval: u64,
 
     /// API mode: v1, v2, or both (default: both)
-    #[arg(long, value_enum, default_value_t = ApiMode::Both)]
+    #[arg(long, value_enum, default_value_t = ApiMode::V1)]
     mode: ApiMode,
 }
 
-async fn create_client(args: &Args) -> Client {
-    let cookie_pairs = login_with_backoff(
-        &args.webdriver_url,
-        &args.username,
-        &args.password,
-        args.headless,
-    )
-    .await;
-
+async fn create_client(cookies: &[(String, Url)]) -> Client {
     let jar = Jar::default();
-    for (cookie_str, url) in cookie_pairs {
+    for (cookie_str, url) in cookies {
         info!("cookie {}: {}", url, cookie_str);
         jar.add_cookie_str(&cookie_str, &url);
     }
@@ -502,12 +498,26 @@ async fn main() {
 
     let recorders: Arc<Mutex<HashMap<i64, Recorder>>> = Default::default();
 
-    let mut client = create_client(&args).await;
+    let mut cookies = login_with_backoff(
+        &args.webdriver_url,
+        &args.username,
+        &args.password,
+        args.headless,
+    )
+    .await;
+    let mut client = create_client(&cookies).await;
     let mut last_login = Instant::now();
 
     loop {
         if last_login.elapsed() >= Duration::from_secs(24 * 60 * 60) {
-            client = create_client(&args).await;
+            cookies = login_with_backoff(
+                &args.webdriver_url,
+                &args.username,
+                &args.password,
+                args.headless,
+            )
+            .await;
+            client = create_client(&cookies).await;
             last_login = Instant::now();
         }
 
@@ -522,7 +532,14 @@ async fn main() {
             Ok(streams) => {
                 for stream in streams {
                     let recorders = recorders.clone();
-                    create_recorder(stream, recorders).await
+
+                    let cookies = cookies
+                        .iter()
+                        .map(|(cookie, _)| cookie.as_str())
+                        .collect::<Vec<&str>>()
+                        .join("; ");
+
+                    create_recorder(stream, cookies, recorders).await
                 }
             }
             Err(e) => error!("failed getting courses: {:#?}", e),
