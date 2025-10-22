@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use rbg_client::apis::configuration::Configuration;
 use rbg_client::models::ProtobufCourseStream;
-use reqwest::cookie::Jar;
+use reqwest::cookie::{CookieStore, Jar};
 use tokio::fs::File;
 use tokio::process::Command;
 
@@ -69,7 +69,10 @@ pub fn convert_thirtyfour_cookies(
     result
 }
 
-async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
+async fn run_recorder(
+    stream: &Stream,
+    cookie_string: &String,
+) -> anyhow::Result<()> {
     println!(
         "Running recorder for stream {}: {} - {}",
         stream.id, stream.course, stream.name
@@ -91,15 +94,21 @@ async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     let stdout_file = File::create(&stdout_log).await?;
     let stderr_file = File::create(&stderr_log).await?;
 
-    let mut child = Command::new("ffmpeg")
-        .args(&[
-            "-i",
-            &stream.url.to_string(),
-            "-c",
-            "copy",
-            "-y",
-            out_file.to_str().unwrap(),
-        ])
+    let mut command = Command::new("ffmpeg");
+    command.args(&[
+        "-i",
+        &stream.url.to_string(),
+        "-c",
+        "copy",
+        // "-headers",
+        // &format!("Cookie: {}", cookie_string),
+        "-y",
+        out_file.to_str().unwrap(),
+    ]);
+
+    println!("running ffmpeg: {:?}", command);
+
+    let mut child = command
         .stdout(Stdio::from(stdout_file.into_std().await))
         .stderr(Stdio::from(stderr_file.into_std().await))
         .spawn()?;
@@ -134,8 +143,8 @@ async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn recorder_thread(stream: Stream) {
-    match run_recorder(&stream).await {
+async fn recorder_thread(stream: Stream, cookie_string: String) {
+    match run_recorder(&stream, &cookie_string).await {
         Ok(()) => {
             println!("Finished recording: {} - {}", stream.course, stream.name)
         }
@@ -202,7 +211,36 @@ struct Stream {
     url: Url,
 }
 
-fn extract_stream(live_course: ProtobufCourseStream) -> Option<Stream> {
+fn extract_stream_v1(live_course: StreamInfo) -> Option<Stream> {
+    let course_name = live_course.course?.name?;
+    let stream = live_course.stream?;
+    let stream_id = stream.id? as i64;
+
+    let name = stream
+        .name
+        .filter(|name| !name.is_empty())
+        .clone()
+        .or_else(|| {
+            stream.start.as_ref().and_then(|s| {
+                s.parse::<DateTime<Utc>>()
+                    .ok()
+                    .map(|dt| dt.format("%Y-%m-%d_%H:%M").to_string())
+            })
+        })
+        .unwrap_or_else(|| stream_id.to_string());
+
+    let url = stream.hls_url?;
+    let url = Url::from_str(&url).ok()?;
+
+    Some(Stream {
+        id: stream_id,
+        course: course_name,
+        name,
+        url,
+    })
+}
+
+fn extract_stream_v2(live_course: ProtobufCourseStream) -> Option<Stream> {
     let course_name = live_course.course?.name?;
     let stream = live_course.stream?;
     let stream_id = stream.id?;
@@ -220,7 +258,15 @@ fn extract_stream(live_course: ProtobufCourseStream) -> Option<Stream> {
         })
         .unwrap_or_else(|| stream_id.to_string());
 
-    let url = stream.hls_url.or(stream.playlist_url)?;
+    let url = stream
+        .hls_url
+        .filter(|s| !s.is_empty())
+        .or(stream.playlist_url)
+        .filter(|s| !s.is_empty())
+        .or(stream.playlist_url_pres)
+        .filter(|s| !s.is_empty())
+        .or(stream.playlist_url_cam)?;
+
     let url = Url::from_str(&url).ok()?;
 
     Some(Stream {
@@ -234,18 +280,102 @@ fn extract_stream(live_course: ProtobufCourseStream) -> Option<Stream> {
 async fn get_streams(
     configuration: &Configuration,
 ) -> anyhow::Result<Vec<Stream>> {
+    let result = get_streams_v2(configuration).await;
+    match result {
+        Ok(streams) => {
+            return Ok(streams);
+        }
+        Err(e) => eprintln!("failed getting courses with v2 api: {}", e),
+    }
+    get_streams_v1(configuration).await
+}
+
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StreamInfo {
+    pub course: Option<Course>,
+    pub stream: Option<StreamV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Course {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StreamV1 {
+    pub id: Option<u32>,
+    pub name: Option<String>,
+    pub hls_url: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub duration: Option<u32>,
+}
+
+async fn get_streams_v1(
+    configuration: &Configuration,
+) -> anyhow::Result<Vec<Stream>> {
+    let live_courses: Vec<StreamInfo> = configuration
+        .client
+        .get("https://live.rbg.tum.de/api/courses/live")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let mut streams = Vec::new();
+    for live_course in live_courses {
+        if let Some(stream) = extract_stream_v1(live_course) {
+            streams.push(stream);
+        }
+    }
+    Ok(streams)
+}
+
+async fn get_streams_v2(
+    configuration: &Configuration,
+) -> anyhow::Result<Vec<Stream>> {
     let live_courses =
         rbg_client::apis::courses_api::get_live_courses(&configuration).await?;
 
     let mut streams = Vec::new();
     if let Some(live_courses) = live_courses.live_courses {
         for live_course in live_courses {
-            if let Some(stream) = extract_stream(live_course) {
+            if let Some(stream) = extract_stream_v2(live_course) {
                 streams.push(stream);
             }
         }
     }
     Ok(streams)
+}
+
+fn ffmpeg_cookie_string(jar: &Jar, url: &str) -> anyhow::Result<String> {
+    let url = Url::from_str(url)?;
+
+    // Extract cookie header for that URL
+    let cookies_opt = jar.cookies(&url);
+    if cookies_opt.is_none() {
+        return Ok(String::new());
+    }
+
+    // Convert to string
+    let cookies_str = cookies_opt
+        .unwrap()
+        .to_str()?
+        .to_string();
+
+    // Escape characters that can confuse ffmpeg’s CLI parser
+    // (like semicolons and quotes)
+    let safe_str = cookies_str
+        .replace(';', "%3B") // semicolon escape
+        .replace('"', "%22") // quote escape
+        .replace('\\', "\\\\"); // backslash safety
+
+    Ok(safe_str)
 }
 
 #[tokio::main]
@@ -254,8 +384,11 @@ async fn main() -> anyhow::Result<()> {
 
     let jar = Jar::default();
     for (cookie_str, url) in cookie_pairs {
+        println!("cookie {}: {}", url, cookie_str);
         jar.add_cookie_str(&cookie_str, &url);
     }
+
+    let cookie_string = ffmpeg_cookie_string(&jar, "https://live.rbg.tum.de/")?;
 
     let client = reqwest::Client::builder()
         .cookie_provider(Arc::new(jar))
@@ -273,7 +406,11 @@ async fn main() -> anyhow::Result<()> {
                 for stream in streams {
                     let id = stream.id;
                     if !recorders.contains_key(&id) {
-                        let recorder = tokio::spawn(recorder_thread(stream));
+                        let cookie_string = cookie_string.clone();
+                        let recorder = tokio::spawn(recorder_thread(
+                            stream,
+                            cookie_string,
+                        ));
                         recorders.insert(id, recorder);
                     }
                 }
