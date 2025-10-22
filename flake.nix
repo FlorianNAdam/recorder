@@ -66,26 +66,22 @@
             wrapProgram $out/bin/recorder \
               --set PATH ${pkgs.ffmpeg}/bin:$PATH
           '';
+
+          passthru = {
+            dockerImage = pkgs.dockerTools.buildImage {
+              name = "recorder";
+              tag = "latest";
+
+              copyToRoot = [
+                pkgs.cacert
+              ];
+              config = {
+                Cmd = [ "${recorder}/bin/recorder" ];
+                Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
+              };
+            };
+          };
         };
-
-        # dockerImage = pkgs.dockerTools.buildImage {
-        #   name = "story_tracker";
-        #   tag = "latest";
-        #   copyToRoot = [
-        #     pkgs.cacert
-
-        #     (pkgs.runCommand "server-with-static" { } ''
-        #       mkdir -p $out/bin
-        #       mkdir -p $out/static
-        #       cp -r ${story_tracker}/bin $out/bin
-        #       cp -r ${story_tracker}/static/* $out/static/
-        #     '')
-        #   ];
-        #   config = {
-        #     Cmd = [ "${story_tracker}/bin/story_tracker_v2" ];
-        #     Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
-        #   };
-        # };
       in
       {
         packages = {
