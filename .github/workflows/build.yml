@@ -23,8 +23,8 @@ jobs:
         version=$(nix eval --raw .#recorder.version)
         name=$(nix eval --raw .#recorder.pname)
         LOCAL_IMAGE="nixops-${name}:${version}"
-        REMOTE_VERSIONED_IMAGE="ghcr.io/FlorianNAdam/${name}:${version}"
-        REMOTE_LATEST_IMAGE="ghcr.io/FlorianNAdam/${name}:latest"
+        REMOTE_VERSIONED_IMAGE="ghcr.io/floriannadam/${name}:${version}"
+        REMOTE_LATEST_IMAGE="ghcr.io/floriannadam/${name}:latest"
         docker load < result
         docker tag $LOCAL_IMAGE $REMOTE_VERSIONED_IMAGE
         docker push $REMOTE_VERSIONED_IMAGE
