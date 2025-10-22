@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
+use clap::Parser;
 use rbg_client::apis::configuration::Configuration;
 use rbg_client::models::ProtobufCourseStream;
 use reqwest::cookie::{CookieStore, Jar};
@@ -7,7 +8,6 @@ use tokio::process::Command;
 
 use sanitize_filename::sanitize;
 use std::collections::HashMap;
-use std::env;
 use std::path::Path;
 use std::process::Stdio;
 use std::str::FromStr;
@@ -19,7 +19,7 @@ use url::Url;
 
 use rbg_client;
 
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 
 pub fn convert_thirtyfour_cookies(
     cookies: &[thirtyfour::Cookie],
@@ -155,16 +155,17 @@ async fn recorder_thread(stream: Stream, cookie_string: String) {
     }
 }
 
-async fn login() -> anyhow::Result<Vec<(String, Url)>> {
-    let username = env::var("TUM_USERNAME")
-        .expect("Environment variable TUM_USERNAME not set");
-
-    let password = env::var("TUM_PASSWORD")
-        .expect("Environment variable TUM_PASSWORD not set");
-
+async fn login(
+    webdriver_url: &str,
+    username: &str,
+    password: &str,
+    headless: bool,
+) -> anyhow::Result<Vec<(String, Url)>> {
     let mut caps = DesiredCapabilities::firefox();
-    caps.set_headless()?;
-    let driver = WebDriver::new("http://localhost:4444", caps).await?;
+    if headless {
+        caps.set_headless()?;
+    }
+    let driver = WebDriver::new(webdriver_url, caps).await?;
 
     driver
         .goto("https://live.rbg.tum.de/saml/out")
@@ -307,8 +308,10 @@ pub struct Course {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StreamV1 {
+    #[serde(rename = "ID")]
     pub id: Option<u32>,
     pub name: Option<String>,
+    #[serde(rename = "HLSUrl")]
     pub hls_url: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
@@ -373,12 +376,59 @@ fn ffmpeg_cookie_string(jar: &Jar, url: &str) -> anyhow::Result<String> {
     Ok(safe_str)
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum ApiMode {
+    V1,
+    V2,
+    Both,
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// WebDriver URL (default: http://localhost:4444)
+    #[arg(
+        long,
+        env = "WEBDRIVER_URL",
+        default_value = "http://localhost:4444"
+    )]
+    webdriver_url: String,
+
+    /// TUM username
+    #[arg(long, env = "TUM_USERNAME")]
+    username: String,
+
+    /// TUM password
+    #[arg(long, env = "TUM_PASSWORD")]
+    password: String,
+
+    /// Run browser in headless mode
+    #[arg(long, default_value_t = true)]
+    headless: bool,
+
+    /// Poll interval in seconds for checking new streams
+    #[arg(long, default_value_t = 10)]
+    poll_interval: u64,
+
+    /// API mode: v1, v2, or both (default: both)
+    #[arg(long, value_enum, default_value_t = ApiMode::Both)]
+    mode: ApiMode,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     info!("Starting RBG recorder...");
 
-    let cookie_pairs = login().await?;
+    let args = Args::parse();
+
+    let cookie_pairs = login(
+        &args.webdriver_url,
+        &args.username,
+        &args.password,
+        args.headless,
+    )
+    .await?;
 
     let jar = Jar::default();
     for (cookie_str, url) in cookie_pairs {
@@ -398,7 +448,12 @@ async fn main() -> anyhow::Result<()> {
     let mut recorders = HashMap::new();
 
     loop {
-        match get_streams(&configuration).await {
+        let results = match args.mode {
+            ApiMode::V1 => get_streams_v1(&configuration).await,
+            ApiMode::V2 => get_streams_v2(&configuration).await,
+            ApiMode::Both => get_streams(&configuration).await,
+        };
+        match results {
             Ok(streams) => {
                 for stream in streams {
                     let id = stream.id;
@@ -415,6 +470,6 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => error!("failed getting courses: {}", e),
         }
 
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(args.poll_interval)).await;
     }
 }

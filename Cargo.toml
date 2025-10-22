@@ -27,3 +27,4 @@ m3u8-rs = "6.0.0"
 sanitize-filename = "0.6.0"
 env_logger = "0.11.8"
 log = "0.4.28"
+clap = { version = "4.5.50", features = ["derive", "env"] }
