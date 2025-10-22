@@ -1,5 +1,6 @@
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
+use regex::Regex;
 use reqwest::cookie::Jar;
 use reqwest::Client;
 use serde::Deserialize;
@@ -424,12 +425,28 @@ struct Args {
     session_timeout: Duration,
 
     /// Run browser in headless mode
-    #[arg(long, default_value_t = true)]
+    #[arg(long, env = "HEADLESS", default_value_t = true)]
     headless: bool,
 
     /// Poll interval for checking new streams
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1m")]
     poll_interval: Duration,
+
+    /// Whitelist regex patterns for course names
+    #[arg(long, env = "WHITELIST", value_delimiter = ',', value_parser=Regex::new)]
+    whitelist: Vec<Regex>,
+
+    /// Blacklist regex patterns for course names
+    #[arg(long, env = "BLACKLIST", value_delimiter = ',', value_parser=Regex::new)]
+    blacklist: Vec<Regex>,
+
+    /// Recordings base directory
+    #[arg(long, env = "RECORDINGS_DIR", default_value = "recordings")]
+    recordings_dir: String,
+
+    /// Logs base directory
+    #[arg(long, env = "LOGS_DIR", default_value = "logs")]
+    logs_dir: String,
 }
 
 async fn create_client(cookies: &[(String, Url)]) -> Client {
@@ -443,6 +460,43 @@ async fn create_client(cookies: &[(String, Url)]) -> Client {
         .cookie_provider(Arc::new(jar))
         .build()
         .expect("failed creating reqwest client")
+}
+
+fn should_record_stream(stream: &Stream, args: &Args) -> bool {
+    let course_name = &stream.course;
+
+    // Check blacklist first
+    for pattern in &args.blacklist {
+        if pattern.is_match(course_name) {
+            info!(
+                "Skipping stream '{}' due to blacklist pattern: {}",
+                course_name, pattern
+            );
+            return false;
+        }
+    }
+
+    // Check whitelist
+    if !args.whitelist.is_empty() {
+        for pattern in &args.whitelist {
+            if pattern.is_match(course_name) {
+                info!(
+                    "Including stream '{}' due to whitelist pattern: {}",
+                    course_name, pattern
+                );
+                return true;
+            }
+        }
+        // If whitelist exists but no patterns match, exclude
+        info!(
+            "Skipping stream '{}' - no whitelist pattern matches",
+            course_name
+        );
+        return false;
+    }
+
+    // If no whitelist, include all (unless blacklisted)
+    true
 }
 
 #[tokio::main]
@@ -493,7 +547,9 @@ async fn main() {
                         .collect::<Vec<&str>>()
                         .join("; ");
 
-                    create_recorder(stream, cookies, recorders).await
+                    if should_record_stream(&stream, &args) {
+                        create_recorder(stream, cookies, recorders).await
+                    }
                 }
             }
             Err(e) => error!("Failed getting courses: {:#?}", e),
