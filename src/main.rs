@@ -87,16 +87,14 @@ async fn run_recorder(
     let safe_name = sanitize(&stream.name);
 
     let base_dir = Path::new("recordings").join(&safe_course);
+    let log_dir = Path::new("logs").join(&safe_course);
+
     let out_file = base_dir.join(format!("{}.mkv", safe_name));
     let final_file = base_dir.join(format!("{}.mp4", safe_name));
-    let log_dir = base_dir.join("logs");
 
     tokio::fs::create_dir_all(&log_dir).await?;
 
-    let stdout_log = log_dir.join(format!("{}_stdout.log", safe_name));
-    let stderr_log = log_dir.join(format!("{}_stderr.log", safe_name));
-
-    let stdout_file = File::create(&stdout_log).await?;
+    let stderr_log = log_dir.join(format!("{}.log", safe_name));
     let stderr_file = File::create(&stderr_log).await?;
 
     let mut url = stream.url.clone();
@@ -115,7 +113,6 @@ async fn run_recorder(
     info!("Running ffmpeg: {:?}", command.as_std());
 
     let mut child = command
-        .stdout(Stdio::from(stdout_file.into_std().await))
         .stderr(Stdio::from(stderr_file.into_std().await))
         .spawn()?;
 
@@ -124,10 +121,7 @@ async fn run_recorder(
         anyhow::bail!("ffmpeg failed (exit code: {})", status)
     }
 
-    let stdout_log = log_dir.join(format!("{}_convert_stdout.log", safe_name));
-    let stderr_log = log_dir.join(format!("{}_convert_stderr.log", safe_name));
-
-    let stdout_file = File::create(&stdout_log).await?;
+    let stderr_log = log_dir.join(format!("{}_convert.log", safe_name));
     let stderr_file = File::create(&stderr_log).await?;
 
     info!("Converting to mp4: {}", safe_name);
@@ -141,7 +135,6 @@ async fn run_recorder(
             "-y",
             final_file.to_str().unwrap(),
         ])
-        .stdout(Stdio::from(stdout_file.into_std().await))
         .stderr(Stdio::from(stderr_file.into_std().await))
         .spawn()?;
 
@@ -333,18 +326,25 @@ fn extract_stream_v1(live_course: StreamInfo) -> Option<Stream> {
     let stream = live_course.stream?;
     let stream_id = stream.id? as i64;
 
-    let name = stream
-        .name
-        .filter(|name| !name.is_empty())
-        .clone()
-        .or_else(|| {
-            stream.start.as_ref().and_then(|s| {
-                s.parse::<DateTime<Utc>>()
-                    .ok()
-                    .map(|dt| dt.format("%Y-%m-%d_%H:%M").to_string())
-            })
-        })
-        .unwrap_or_else(|| stream_id.to_string());
+    let name = {
+        let date_prefix = stream.start.as_ref().and_then(|s| {
+            s.parse::<DateTime<Utc>>()
+                .ok()
+                .map(|dt| dt.format("%Y-%m-%d_%H%M").to_string())
+        });
+
+        let base_name = stream
+            .name
+            .clone()
+            .filter(|n| !n.is_empty());
+
+        match (date_prefix, base_name) {
+            (Some(date), Some(name)) => format!("{}_{}", date, name),
+            (Some(date), None) => date,
+            (None, Some(name)) => name,
+            (None, None) => stream_id.to_string(),
+        }
+    };
 
     let url = stream.hls_url?;
     let url = Url::from_str(&url).ok()?;

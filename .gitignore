@@ -4,4 +4,5 @@
 .devenv
 /rbg_client
 /recordings
+/logs
 result
