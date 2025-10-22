@@ -1,10 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
-
-use rbg_client::apis::configuration::Configuration;
-use rbg_client::models::ProtobufCourseStream;
 use reqwest::cookie::Jar;
 use reqwest::Client;
+use serde::Deserialize;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::{fs::File, sync::Mutex};
@@ -20,9 +18,7 @@ use thirtyfour::prelude::*;
 use tokio::time::{sleep, Instant};
 use url::Url;
 
-use rbg_client;
-
-use log::{error, info, warn};
+use log::{error, info};
 
 pub fn convert_thirtyfour_cookies(
     cookies: &[thirtyfour::Cookie],
@@ -89,10 +85,11 @@ async fn run_recorder(
     let base_dir = Path::new("recordings").join(&safe_course);
     let log_dir = Path::new("logs").join(&safe_course);
 
+    tokio::fs::create_dir_all(&base_dir).await?;
+    tokio::fs::create_dir_all(&log_dir).await?;
+
     let out_file = base_dir.join(format!("{}.mkv", safe_name));
     let final_file = base_dir.join(format!("{}.mp4", safe_name));
-
-    tokio::fs::create_dir_all(&log_dir).await?;
 
     let stderr_log = log_dir.join(format!("{}.log", safe_name));
     let stderr_file = File::create(&stderr_log).await?;
@@ -321,7 +318,7 @@ struct Stream {
     url: Url,
 }
 
-fn extract_stream_v1(live_course: StreamInfo) -> Option<Stream> {
+fn extract_stream(live_course: StreamInfo) -> Option<Stream> {
     let course_name = live_course.course?.name?;
     let stream = live_course.stream?;
     let stream_id = stream.id? as i64;
@@ -357,55 +354,6 @@ fn extract_stream_v1(live_course: StreamInfo) -> Option<Stream> {
     })
 }
 
-fn extract_stream_v2(live_course: ProtobufCourseStream) -> Option<Stream> {
-    let course_name = live_course.course?.name?;
-    let stream = live_course.stream?;
-    let stream_id = stream.id?;
-
-    let name = stream
-        .name
-        .filter(|name| !name.is_empty())
-        .clone()
-        .or_else(|| {
-            stream.start.as_ref().and_then(|s| {
-                s.parse::<DateTime<Utc>>()
-                    .ok()
-                    .map(|dt| dt.format("%Y-%m-%d_%H:%M").to_string())
-            })
-        })
-        .unwrap_or_else(|| stream_id.to_string());
-
-    let url = stream
-        .hls_url
-        .filter(|s| !s.is_empty())
-        .or(stream.playlist_url)
-        .filter(|s| !s.is_empty())
-        .or(stream.playlist_url_pres)
-        .filter(|s| !s.is_empty())
-        .or(stream.playlist_url_cam)?;
-
-    let url = Url::from_str(&url).ok()?;
-
-    Some(Stream {
-        id: stream_id,
-        course: course_name,
-        name,
-        url,
-    })
-}
-
-async fn get_streams(client: Client) -> anyhow::Result<Vec<Stream>> {
-    match get_streams_v2(client.clone()).await {
-        Ok(streams) => Ok(streams),
-        Err(e) => {
-            warn!("failed getting courses with v2 api: {:#?}", e);
-            get_streams_v1(client).await
-        }
-    }
-}
-
-use serde::Deserialize;
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct StreamInfo {
@@ -432,8 +380,8 @@ pub struct StreamV1 {
     pub duration: Option<u32>,
 }
 
-async fn get_streams_v1(client: Client) -> anyhow::Result<Vec<Stream>> {
-    info!("Getting streams with api v1");
+async fn get_streams(client: Client) -> anyhow::Result<Vec<Stream>> {
+    info!("Getting streams");
 
     let response = client
         .get("https://live.rbg.tum.de/api/courses/live")
@@ -445,38 +393,11 @@ async fn get_streams_v1(client: Client) -> anyhow::Result<Vec<Stream>> {
 
     let mut streams = Vec::new();
     for live_course in live_courses {
-        if let Some(stream) = extract_stream_v1(live_course) {
+        if let Some(stream) = extract_stream(live_course) {
             streams.push(stream);
         }
     }
     Ok(streams)
-}
-
-async fn get_streams_v2(client: Client) -> anyhow::Result<Vec<Stream>> {
-    info!("Getting streams with api v2");
-
-    let mut configuration = Configuration::new();
-    configuration.client = client.clone();
-
-    let live_courses =
-        rbg_client::apis::courses_api::get_live_courses(&configuration).await?;
-
-    let mut streams = Vec::new();
-    if let Some(live_courses) = live_courses.live_courses {
-        for live_course in live_courses {
-            if let Some(stream) = extract_stream_v2(live_course) {
-                streams.push(stream);
-            }
-        }
-    }
-    Ok(streams)
-}
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-enum ApiMode {
-    V1,
-    V2,
-    Both,
 }
 
 #[derive(Parser, Debug)]
@@ -509,10 +430,6 @@ struct Args {
     /// Poll interval for checking new streams
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1m")]
     poll_interval: Duration,
-
-    /// API mode: v1, v2, or both (default: both)
-    #[arg(long, value_enum, default_value_t = ApiMode::V1)]
-    mode: ApiMode,
 }
 
 async fn create_client(cookies: &[(String, Url)]) -> Client {
@@ -565,13 +482,7 @@ async fn main() {
         }
 
         let client = client.clone();
-        let results = match args.mode {
-            ApiMode::V1 => get_streams_v1(client).await,
-            ApiMode::V2 => get_streams_v2(client).await,
-            ApiMode::Both => get_streams(client).await,
-        };
-
-        match results {
+        match get_streams(client).await {
             Ok(streams) => {
                 for stream in streams {
                     let recorders = recorders.clone();
