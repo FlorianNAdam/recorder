@@ -73,7 +73,10 @@ pub fn convert_thirtyfour_cookies(
     result
 }
 
-async fn run_recorder(stream: &Stream, _cookies: String) -> anyhow::Result<()> {
+async fn run_recorder(
+    stream: &Stream,
+    _cookies: &String,
+) -> anyhow::Result<()> {
     info!(
         "Running recorder for stream {}: {} - {}",
         stream.id, stream.course, stream.name
@@ -116,7 +119,9 @@ async fn run_recorder(stream: &Stream, _cookies: String) -> anyhow::Result<()> {
         .spawn()?;
 
     let status = child.wait().await?;
-    info!("ffmpeg exited with: {}", status);
+    if !status.success() {
+        anyhow::bail!("ffmpeg failed (exit code: {})", status)
+    }
 
     let stdout_log = log_dir.join(format!("{}_convert_stdout.log", safe_name));
     let stderr_log = log_dir.join(format!("{}_convert_stderr.log", safe_name));
@@ -145,22 +150,17 @@ async fn run_recorder(stream: &Stream, _cookies: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn recorder_thread(stream: Stream, cookies: String) {
-    match run_recorder(&stream, cookies).await {
-        Ok(()) => {
-            info!("Finished recording: {} - {}", stream.course, stream.name)
-        }
-        Err(e) => error!(
-            "Failed recording: {} - {} due to: {:#?}",
-            stream.course, stream.name, e
-        ),
-    }
-}
-
 #[allow(dead_code)]
 struct Recorder {
     stream: Stream,
+    status: RecorderStatus,
     handle: JoinHandle<()>,
+}
+
+enum RecorderStatus {
+    Recording,
+    Finished,
+    Failed,
 }
 
 async fn create_recorder(
@@ -174,14 +174,54 @@ async fn create_recorder(
         let handle = {
             let recorders = recorders.clone();
             let stream = stream.clone();
+            let cookies = cookies.clone();
+
             tokio::spawn(async move {
-                recorder_thread(stream, cookies).await;
-                sleep(Duration::from_secs(10)).await;
-                let mut locked_recorders = recorders.lock().await;
-                locked_recorders.remove(&id);
+                let mut delay = Duration::from_secs(2);
+
+                loop {
+                    match run_recorder(&stream, &cookies).await {
+                        Ok(()) => {
+                            info!(
+                                "Finished recording: {} - {}",
+                                stream.course, stream.name
+                            );
+                            let mut locked_recorders = recorders.lock().await;
+                            if let Some(recorder) =
+                                locked_recorders.get_mut(&id)
+                            {
+                                recorder.status = RecorderStatus::Finished;
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed recording: {} - {} due to: {:#?}. Retrying in {:?}...",
+                                stream.course, stream.name, e, delay
+                            );
+                            {
+                                let mut locked_recorders =
+                                    recorders.lock().await;
+                                if let Some(recorder) =
+                                    locked_recorders.get_mut(&id)
+                                {
+                                    recorder.status = RecorderStatus::Failed;
+                                }
+                            }
+                            sleep(delay).await;
+                            delay *= 2;
+                        }
+                    }
+                }
             })
         };
-        let recorder = Recorder { stream, handle };
+
+        let recorder = Recorder {
+            stream,
+            status: RecorderStatus::Recording,
+            handle,
+        };
+
         locked_recorders.insert(id, recorder);
     }
 }
