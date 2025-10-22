@@ -2,9 +2,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use rbg_client::apis::configuration::Configuration;
 use rbg_client::models::ProtobufCourseStream;
-use reqwest::cookie::{CookieStore, Jar};
-use tokio::fs::File;
+use reqwest::cookie::Jar;
+use reqwest::Client;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
+use tokio::{fs::File, sync::Mutex};
 
 use sanitize_filename::sanitize;
 use std::collections::HashMap;
@@ -14,7 +16,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use thirtyfour::prelude::*;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use url::Url;
 
 use rbg_client;
@@ -71,10 +73,7 @@ pub fn convert_thirtyfour_cookies(
     result
 }
 
-async fn run_recorder(
-    stream: &Stream,
-    cookie_string: &String,
-) -> anyhow::Result<()> {
+async fn run_recorder(stream: &Stream) -> anyhow::Result<()> {
     info!(
         "Running recorder for stream {}: {} - {}",
         stream.id, stream.course, stream.name
@@ -106,7 +105,7 @@ async fn run_recorder(
         out_file.to_str().unwrap(),
     ]);
 
-    info!("running ffmpeg: {:?}", command);
+    info!("running ffmpeg: {:?}", command.as_std());
 
     let mut child = command
         .stdout(Stdio::from(stdout_file.into_std().await))
@@ -143,15 +142,43 @@ async fn run_recorder(
     Ok(())
 }
 
-async fn recorder_thread(stream: Stream, cookie_string: String) {
-    match run_recorder(&stream, &cookie_string).await {
+async fn recorder_thread(stream: Stream) {
+    match run_recorder(&stream).await {
         Ok(()) => {
             info!("Finished recording: {} - {}", stream.course, stream.name)
         }
         Err(e) => error!(
-            "Failed recording: {} - {} due to: {}",
+            "Failed recording: {} - {} due to: {:#?}",
             stream.course, stream.name, e
         ),
+    }
+}
+
+#[allow(dead_code)]
+struct Recorder {
+    stream: Stream,
+    handle: JoinHandle<()>,
+}
+
+async fn create_recorder(
+    stream: Stream,
+    recorders: Arc<Mutex<HashMap<i64, Recorder>>>,
+) {
+    let id = stream.id;
+    let mut locked_recorders = recorders.lock().await;
+    if !locked_recorders.contains_key(&id) {
+        let handle = {
+            let recorders = recorders.clone();
+            let stream = stream.clone();
+            tokio::spawn(async move {
+                recorder_thread(stream).await;
+                sleep(Duration::from_secs(10)).await;
+                let mut locked_recorders = recorders.lock().await;
+                locked_recorders.remove(&id);
+            })
+        };
+        let recorder = Recorder { stream, handle };
+        locked_recorders.insert(id, recorder);
     }
 }
 
@@ -208,12 +235,45 @@ async fn login(
     }
     let driver = WebDriver::new(webdriver_url, caps).await?;
     let result = inner_login(&driver, username, password).await;
+    let source = driver.source().await;
     driver.quit().await?;
 
-    result
+    match result {
+        Ok(cookies) => Ok(cookies),
+        Err(e) => {
+            error!("Page: {:#?}", source);
+            return Err(e);
+        }
+    }
 }
 
-#[derive(Debug)]
+async fn login_with_backoff(
+    webdriver_url: &str,
+    username: &str,
+    password: &str,
+    headless: bool,
+) -> Vec<(String, Url)> {
+    let mut attempt = 0;
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        attempt += 1;
+        info!("Attempting login");
+        match login(webdriver_url, username, password, headless).await {
+            Ok(cookies) => return cookies,
+            Err(e) => {
+                error!(
+                    "Login attempt {} failed: {:#?}. Retrying in {:?}...",
+                    attempt, e, delay
+                );
+                sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Stream {
     id: i64,
     course: String,
@@ -287,14 +347,12 @@ fn extract_stream_v2(live_course: ProtobufCourseStream) -> Option<Stream> {
     })
 }
 
-async fn get_streams(
-    configuration: &Configuration,
-) -> anyhow::Result<Vec<Stream>> {
-    match get_streams_v2(configuration).await {
+async fn get_streams(client: Client) -> anyhow::Result<Vec<Stream>> {
+    match get_streams_v2(client.clone()).await {
         Ok(streams) => Ok(streams),
         Err(e) => {
-            warn!("failed getting courses with v2 api: {}", e);
-            get_streams_v1(configuration).await
+            warn!("failed getting courses with v2 api: {:#?}", e);
+            get_streams_v1(client).await
         }
     }
 }
@@ -327,16 +385,16 @@ pub struct StreamV1 {
     pub duration: Option<u32>,
 }
 
-async fn get_streams_v1(
-    configuration: &Configuration,
-) -> anyhow::Result<Vec<Stream>> {
-    let live_courses: Vec<StreamInfo> = configuration
-        .client
+async fn get_streams_v1(client: Client) -> anyhow::Result<Vec<Stream>> {
+    info!("Getting streams with api v1");
+
+    let response = client
         .get("https://live.rbg.tum.de/api/courses/live")
         .send()
         .await?
-        .json()
-        .await?;
+        .error_for_status()?;
+
+    let live_courses: Vec<StreamInfo> = response.json().await?;
 
     let mut streams = Vec::new();
     for live_course in live_courses {
@@ -347,9 +405,12 @@ async fn get_streams_v1(
     Ok(streams)
 }
 
-async fn get_streams_v2(
-    configuration: &Configuration,
-) -> anyhow::Result<Vec<Stream>> {
+async fn get_streams_v2(client: Client) -> anyhow::Result<Vec<Stream>> {
+    info!("Getting streams with api v2");
+
+    let mut configuration = Configuration::new();
+    configuration.client = client.clone();
+
     let live_courses =
         rbg_client::apis::courses_api::get_live_courses(&configuration).await?;
 
@@ -362,27 +423,6 @@ async fn get_streams_v2(
         }
     }
     Ok(streams)
-}
-
-fn ffmpeg_cookie_string(jar: &Jar, url: &str) -> anyhow::Result<String> {
-    let url = Url::from_str(url)?;
-
-    let cookies_opt = jar.cookies(&url);
-    if cookies_opt.is_none() {
-        return Ok(String::new());
-    }
-
-    let cookies_str = cookies_opt
-        .unwrap()
-        .to_str()?
-        .to_string();
-
-    let safe_str = cookies_str
-        .replace(';', "%3B")
-        .replace('"', "%22")
-        .replace('\\', "\\\\");
-
-    Ok(safe_str)
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -411,6 +451,10 @@ struct Args {
     #[arg(long, env = "TUM_PASSWORD")]
     password: String,
 
+    /// How long to use a login session
+    #[arg(long, default_value_t = 10)]
+    session_timeout: u64,
+
     /// Run browser in headless mode
     #[arg(long, default_value_t = true)]
     headless: bool,
@@ -424,20 +468,14 @@ struct Args {
     mode: ApiMode,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-    info!("Starting RBG recorder...");
-
-    let args = Args::parse();
-
-    let cookie_pairs = login(
+async fn create_client(args: &Args) -> Client {
+    let cookie_pairs = login_with_backoff(
         &args.webdriver_url,
         &args.username,
         &args.password,
         args.headless,
     )
-    .await?;
+    .await;
 
     let jar = Jar::default();
     for (cookie_str, url) in cookie_pairs {
@@ -445,38 +483,49 @@ async fn main() -> anyhow::Result<()> {
         jar.add_cookie_str(&cookie_str, &url);
     }
 
-    let cookie_string = ffmpeg_cookie_string(&jar, "https://live.rbg.tum.de/")?;
-
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .cookie_provider(Arc::new(jar))
-        .build()?;
+        .build()
+        .expect("failed creating reqwest client")
+}
 
-    let mut configuration = Configuration::new();
-    configuration.client = client;
+#[tokio::main]
+async fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .init();
 
-    let mut recorders = HashMap::new();
+    info!("Starting RBG recorder...");
+
+    let args = Args::parse();
+
+    let recorders: Arc<Mutex<HashMap<i64, Recorder>>> = Default::default();
+
+    let mut client = create_client(&args).await;
+    let mut last_login = Instant::now();
 
     loop {
+        if last_login.elapsed() >= Duration::from_secs(24 * 60 * 60) {
+            client = create_client(&args).await;
+            last_login = Instant::now();
+        }
+
+        let client = client.clone();
         let results = match args.mode {
-            ApiMode::V1 => get_streams_v1(&configuration).await,
-            ApiMode::V2 => get_streams_v2(&configuration).await,
-            ApiMode::Both => get_streams(&configuration).await,
+            ApiMode::V1 => get_streams_v1(client).await,
+            ApiMode::V2 => get_streams_v2(client).await,
+            ApiMode::Both => get_streams(client).await,
         };
+
         match results {
             Ok(streams) => {
                 for stream in streams {
-                    let id = stream.id;
-                    if !recorders.contains_key(&id) {
-                        let cookie_string = cookie_string.clone();
-                        let recorder = tokio::spawn(recorder_thread(
-                            stream,
-                            cookie_string,
-                        ));
-                        recorders.insert(id, recorder);
-                    }
+                    let recorders = recorders.clone();
+                    create_recorder(stream, recorders).await
                 }
             }
-            Err(e) => error!("failed getting courses: {}", e),
+            Err(e) => error!("failed getting courses: {:#?}", e),
         }
 
         sleep(Duration::from_secs(args.poll_interval)).await;
