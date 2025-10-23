@@ -1,0 +1,37 @@
+name: Tag Nix Version
+on:
+  workflow_run:
+    workflows: ["Build and Release Docker Image"]
+    types:
+      - completed
+permissions:
+  contents: write  
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v25
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Get version from Nix
+        id: get_version
+        run: |
+          version=$(nix eval --raw .#recorder.version)
+          echo "Version detected: $version"
+          echo "version=$version" >> $GITHUB_ENV
+      - name: Create Git tag
+        run: |
+          version=${{ env.version }}
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists. Skipping."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v$version"
+          git push origin "v$version"
+
