@@ -4,6 +4,7 @@ use regex::Regex;
 use reqwest::cookie::Jar;
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::fs::remove_file;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::{fs::File, sync::Mutex};
@@ -122,7 +123,7 @@ async fn run_recorder(
     let stderr_log = log_dir.join(format!("{}_convert.log", safe_name));
     let stderr_file = File::create(&stderr_log).await?;
 
-    info!("Converting to mp4: {}", safe_name);
+    info!("Converting to mp4: {:?}", out_file);
 
     let mut child = Command::new("ffmpeg")
         .args(&[
@@ -140,6 +141,10 @@ async fn run_recorder(
     if !status.success() {
         anyhow::bail!("ffmpeg failed (exit code: {})", status)
     }
+
+    info!("Deleting mkv: {:?}", out_file);
+
+    remove_file(out_file).await?;
 
     Ok(())
 }
@@ -412,12 +417,12 @@ struct Args {
     )]
     webdriver_url: String,
 
-    /// TUM username
-    #[arg(long, env = "TUM_USERNAME")]
+    /// username
+    #[arg(long, env = "USERNAME")]
     username: String,
 
-    /// TUM password
-    #[arg(long, env = "TUM_PASSWORD")]
+    /// password
+    #[arg(long, env = "PASSWORD")]
     password: String,
 
     /// How long to use a login session
