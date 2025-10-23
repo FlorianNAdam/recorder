@@ -109,7 +109,15 @@ async fn run_recorder(
         out_file.to_str().unwrap(),
     ]);
 
-    info!("Running ffmpeg: {:?}", command.as_std());
+    info!(
+        "Running ffmpeg: \"ffmpeg {}\"",
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     let mut child = command
         .stderr(Stdio::from(stderr_file.into_std().await))
@@ -125,15 +133,27 @@ async fn run_recorder(
 
     info!("Converting to mp4: {:?}", out_file);
 
-    let mut child = Command::new("ffmpeg")
-        .args(&[
-            "-i",
-            out_file.to_str().unwrap(),
-            "-codec",
-            "copy",
-            "-y",
-            final_file.to_str().unwrap(),
-        ])
+    let mut command = Command::new("ffmpeg");
+    command.args(&[
+        "-i",
+        out_file.to_str().unwrap(),
+        "-codec",
+        "copy",
+        "-y",
+        final_file.to_str().unwrap(),
+    ]);
+
+    info!(
+        "Running ffmpeg: \"ffmpeg {}\"",
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    let mut child = command
         .stderr(Stdio::from(stderr_file.into_std().await))
         .spawn()?;
 
@@ -333,7 +353,7 @@ fn extract_stream(live_course: StreamInfo) -> Option<Stream> {
         let date_prefix = stream.start.as_ref().and_then(|s| {
             s.parse::<DateTime<Utc>>()
                 .ok()
-                .map(|dt| dt.format("%Y-%m-%d_%H%M").to_string())
+                .map(|dt| dt.format("%Y-%m-%d_%H:%M").to_string())
         });
 
         let base_name = stream
