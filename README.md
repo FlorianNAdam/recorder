@@ -1,5 +1,5 @@
 # Recorder
-[![Build Docker Image](https://img.shields.io/badge/Build_Docker_Image-passing-brightgreen)](https://github.com/FlorianNAdam/recorder/actions/workflows/build.yml)
+[![Build Docker Image](https://img.shields.io/badge/Build_Docker_Image-passing-brightgreen)](https://github.com/FlorianNAdam/recorder/actions/workflows/build_docker_image.yml)
 
 A Rust-based recorder for live streams, supporting automatic login, filtering, and recording streams with `ffmpeg`.
 
