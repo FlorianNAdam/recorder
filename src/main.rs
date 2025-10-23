@@ -446,7 +446,7 @@ struct Args {
     password: String,
 
     /// How long to use a login session
-    #[arg(long, value_parser = humantime::parse_duration, default_value = "6h")]
+    #[arg(long, env = "SESSION_TIMEOUT", value_parser = humantime::parse_duration, default_value = "6h")]
     session_timeout: Duration,
 
     /// Run browser in headless mode
@@ -454,7 +454,7 @@ struct Args {
     headless: bool,
 
     /// Poll interval for checking new streams
-    #[arg(long, value_parser = humantime::parse_duration, default_value = "1m")]
+    #[arg(long, env = "POLL_INTERVAL", value_parser = humantime::parse_duration, default_value = "1m")]
     poll_interval: Duration,
 
     /// Whitelist regex patterns for course names

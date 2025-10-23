@@ -54,6 +54,7 @@
       {
         packages = {
           inherit recorder;
+          default = recorder;
         };
 
         devShell = pkgs.mkShell {
